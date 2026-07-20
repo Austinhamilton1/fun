@@ -47,8 +47,8 @@ class ImageLoss(nn.Module):
 
         self.loss_fn = loss_fn
 
-    def forward(self, logits, input_img):
-        return self.loss_fn(logits, input_img)
+    def forward(self, logits):
+        return self.loss_fn(logits)
 
 def train_generator(model_name, noise_dir, loss_fn, epochs=50):
     transform = transforms.Compose([

@@ -173,4 +173,22 @@ if __name__ == '__main__':
 
         save_model(dataset=dataset, model_filename=f'./models/{args.output}')
     elif args.generator:
-        pass
+        from autoencoder import load_model
+        from torchvision import datasets
+        from torchvision import transforms
+
+        transform = transforms.Compose([
+            transforms.Grayscale(num_output_channels=1),
+            transforms.Resize((args.image_size, args.image_size)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+        ])
+        dataset = datasets.ImageFolder(
+            root=f'./data/{args.data}',
+            transform=transform,
+        )
+
+        autoencoder = load_model('./models/city_encoder.pt')
+
+        def loss(logits):
+            pass
