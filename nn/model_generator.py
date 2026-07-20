@@ -3,12 +3,16 @@ import requests
 from pathlib import Path
 import time
 import os
+import random
 
 # Wikimedia commons requires a unique User-Agent header
 # They prefer that the header includes contact information
 HEADERS = {
     'User-Agent': 'CNNTrainerBot/1.0 (austinhamilton034@gmail.com)',
 }
+
+session = requests.Session()
+session.headers.update(HEADERS)
 
 def fetch_image_urls(query, count=50):
     '''
@@ -26,11 +30,12 @@ def fetch_image_urls(query, count=50):
         'gsrlimit': 50,
         'prop': 'imageinfo',    # Request information about the files
         'iiprop': 'url',        # Specific metadata properties to pull
+        'iiurlwidth': 512,
     }
 
     while len(image_urls) < count:
         print(f'Fetching metadata... (Gathered {len(image_urls)}/{count})')
-        response = requests.get(url, headers=HEADERS, params=params)
+        response = session.get(url, params=params)
 
         if response.status_code != 200:
             print(f'Error reading API: {response.status_code}')
@@ -73,18 +78,19 @@ def download_images(urls, folder):
 
         try:
             print(f'Downloading [{idx}/{len(urls)}]: {filename}')
-            res = requests.get(url, headers=HEADERS, stream=True)
+            res = session.get(url, stream=True)
 
             if res.status_code == 200:
                 with open(save_path, 'wb') as f:
                     for chunk in res.iter_content(chunk_size=8192):
                         f.write(chunk)
             elif res.status_code == 429:
-                print('Hit rate limit! Sleeping for 30 seconds...')
-                time.sleep(30)
+                retry = int(res.headers.get('Retry-After', '30'))
+                print(f'Hit rate limit! Sleeping for {retry} seconds...')
+                time.sleep(retry)
 
                 # Retry once
-                res = requests.get(url, headers=HEADERS, stream=True)
+                res = session.get(url, stream=True)
                 if res.status_code == 200:
                     with open(save_path, 'wb') as f:
                         for chunk in res.iter_content(chunk_size=8192):
@@ -96,9 +102,8 @@ def download_images(urls, folder):
             print(f'Network error on {filename}: {e}')
 
         # Polite Concurrency Contract
-        # Pausing 0.5s safeguards against automated IP block triggers
-        time.sleep(0.5)
-
+        # Pausing ~2s safeguards against automated IP block triggers
+        time.sleep(random.uniform(1.0, 3.0))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(
@@ -110,14 +115,13 @@ if __name__ == '__main__':
 
     parser.add_argument('-c', '--clean', action='store_true')
 
-    parser.add_argument('-r', '--random', action='store_true')
-
     parser.add_argument('-e', '--encoder', action='store_true')
     parser.add_argument('-o', '--output')
     parser.add_argument('-d', '--data')
     parser.add_argument('-s', '--image-size', type=int)
 
     parser.add_argument('-g', '--generator', action='store_true')
+    parser.add_argument('-i', '--input')
 
     args = parser.parse_args()
 
@@ -129,32 +133,38 @@ if __name__ == '__main__':
         from PIL import Image
 
         LIMIT = 50_000_000
-        folder = Path(f'data/{args.data}')
 
-        for path in folder.rglob('*'):
+        folder = Path(f'./data/{args.data}')
+
+        for path in folder.rglob("*"):
             if not path.is_file():
                 continue
 
             try:
                 with Image.open(path) as img:
-
+                    # Remove absurdly large images
                     if img.width * img.height > LIMIT:
-                        print('Deleting', path)
+                        print(f"Deleting (too large): {path}")
                         path.unlink()
+                        continue
 
-            except Exception:
+                    # Convert to a standard pixel format
+                    if img.mode == "P":
+                        # Palette image -> RGBA
+                        img = img.convert("RGBA")
+                    elif img.mode in ("RGBA", "LA"):
+                        # Keep transparency
+                        img = img.convert("RGBA")
+                    else:
+                        # RGB, L, CMYK, etc. -> RGB
+                        img = img.convert("RGB")
+
+                    # Overwrite the original file
+                    img.save(path)
+
+            except Exception as e:
+                print(f"Deleting (corrupt): {path} ({e})")
                 path.unlink()
-    elif args.random:
-        import numpy as np
-        from PIL import Image
-
-        n = args.count if args.count else 50
-
-        for i in range(n):
-            img_name = f'./data/noise/random/random_{i}.png'
-            random = np.random.randint(0, 256, size=(256, 256), dtype=np.uint8)
-            img = Image.fromarray(random, mode='L')
-            img.save(img_name)
     elif args.encoder:
         from autoencoder import save_model
         from torchvision import datasets
@@ -173,22 +183,6 @@ if __name__ == '__main__':
 
         save_model(dataset=dataset, model_filename=f'./models/{args.output}')
     elif args.generator:
-        from autoencoder import load_model
-        from torchvision import datasets
-        from torchvision import transforms
+        from generator import save_generator
 
-        transform = transforms.Compose([
-            transforms.Grayscale(num_output_channels=1),
-            transforms.Resize((args.image_size, args.image_size)),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-        ])
-        dataset = datasets.ImageFolder(
-            root=f'./data/{args.data}',
-            transform=transform,
-        )
-
-        autoencoder = load_model('./models/city_encoder.pt')
-
-        def loss(logits):
-            pass
+        save_generator(f'./models/{args.output}', f'./models/{args.input}')

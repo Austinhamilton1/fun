@@ -1,9 +1,8 @@
-import numpy as np
-import torch
 from torch import nn
-from torch.utils.data import DataLoader
-from torchvision import transforms, datasets
-import os
+from torch._dynamo.config import same_two_models_use_fp64
+from torchvision.models.squeezenet import torch
+from tqdm import tqdm
+from autoencoder import load_model, sample_scales, make_scaled_image, scale_consistency_loss
 
 class ResidualBlock(nn.Module):
     def __init__(self, channels):
@@ -37,54 +36,116 @@ class Generator(nn.Module):
         )
 
     def forward(self, x):
-        x = x.unsqueeze(1)
-        x = self.network(x)
-        return x.squeeze(1)
+        return self.network(x)
 
-class ImageLoss(nn.Module):
-    def __init__(self, loss_fn):
-        super().__init__()
+def variance_loss(img):
+    '''
+    Prevent generator collapse
 
-        self.loss_fn = loss_fn
+    img:
+        (B, 1, H, W)
+    '''
+    variance = torch.var(img, dim=[1,2,3])
 
-    def forward(self, logits):
-        return self.loss_fn(logits)
+    # Maximize variance
+    return -variance.mean()
 
-def train_generator(model_name, noise_dir, loss_fn, epochs=50):
-    transform = transforms.Compose([
-        transforms.Grayscale(num_output_channels=1),
-        transforms.Resize((256, 256)),
-        transforms.ToTensor(),
-    ])
+def generator_scale_loss(
+    encoder,
+    images,
+    num_scales=4,
+):
+    scales = sample_scales(num_scales)
 
-    data = datasets(root=noise_dir, transform=transform)
+    latents = []
+    for s in scales:
+        scaled = make_scaled_image(images, same_two_models_use_fp64)
+        z = encoder.encode(scaled)
+        latents.append(z)
 
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-
-    model = Generator().to(device)
-    criterion = ImageLoss(loss_fn).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=5e-3)
-
-    loader = DataLoader(
-        data,
-        batch_size=8,
-        shuffle=True,
-        num_workers=0,
-        pin_memory=True,
+    latents = torch.stack(
+        latents,
+        dim=1,
     )
 
-    model.train()
-    for i in range(epochs):
-        for j, batch in enumerate(loader):
-            batch = batch.to(device, non_blocking=True)
-            optimizer.zero_grad()
-            output = model(batch)
+    return scale_consistency_loss(
+        latents,
+        scales,
+    )
 
-            loss = criterion(output, batch)
-            loss.backward()
-            optimizer.step()
+def train_generator(
+    generator,
+    encoder,
+    device='cuda',
+    epochs=1000,
+    batch_size=8,
+    lr=1e-4,
+    image_size=256,
+):
+    optimizer = torch.optim.Adam(
+        generator.parameters(),
+        lr=lr,
+    )
 
-        print(f'Epoch: {i}, Loss: {loss.item()}')
+    generator.to(device)
 
-    os.makedirs('models', exist_ok=True)
-    torch.save(model.state_dict(), f'models/{model_name}.pt')
+    for epoch in tqdm(range(epochs)):
+        generator.train()
+
+        # Random input noise
+        noise = torch.randn(
+            batch_size,
+            1,
+            image_size,
+            image_size,
+            device=device,
+        )
+
+        generated = generator(noise)
+        generated = torch.sigmoid(generated)
+
+        # Scale equivariance
+        latent_loss = generator_scale_loss(
+            encoder,
+            generated,
+        )
+
+        # Prevent collapse
+        diversity_loss = variance_loss(generated)
+
+        loss = (
+            latent_loss
+            + 0.01 * diversity_loss
+        )
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return generator
+
+def save_generator(
+    filename,
+    encoder_path,
+):
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    encoder = load_model(encoder_path).to(device)
+
+    encoder.eval()
+
+    for p in encoder.parameters():
+        p.requires_grad = False
+
+    generator = Generator()
+
+    generator = train_generator(
+        generator,
+        encoder,
+        device=device,
+    )
+
+    torch.save(
+        generator.state_dict(),
+        filename,
+    )
